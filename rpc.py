@@ -39,6 +39,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 class RPCRequestHandler(BaseHTTPRequestHandler):
     key = ''
     globals_dict = None
+    locals_dict={}
     favicon_bytes = None
     def log_message(self, format, *args):
         print(f"[RPC] {self.address_string()} - {format % args}")
@@ -59,8 +60,6 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             # 原始路径（包括查询字符串），不做任何解析
             raw_path = self.path
             # 去掉开头的斜杠
-            if raw_path.startswith('/'):
-                raw_path = raw_path[1:]
             # 验证并去除 key 前缀（如果设置了 key）
             if self.key:
                 prefix = self.key + '/'
@@ -68,7 +67,9 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                     self.send_error(403, "Forbidden")
                     return
                 code_str = raw_path[len(prefix):]  # 去除 key/ 后剩余部分（可能包含 ?）
-            else:
+            else:            
+                if raw_path.startswith('/'):
+                    raw_path = raw_path[1:]
                 code_str = raw_path
             if not code_str:
                 self.send_error(400, "No code")
@@ -98,11 +99,10 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             old_stdout = sys.stdout
             sys.stdout = io.StringIO()
             try:
-                local_scope = {}
-                exec(code, exec_globals, local_scope)
+                exec(code, exec_globals,self.locals_dict)
                 output = sys.stdout.getvalue()
-                if 'r' in local_scope:
-                    result_obj = local_scope['r']
+                if 'r' in self.locals_dict:
+                    result_obj = self.locals_dict['r']
                 elif 'r' in exec_globals:
                     result_obj = exec_globals['r']
                 elif resp.data is not None:
@@ -126,10 +126,11 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error(500, str(e))
 
-def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals_dict=None, daemon=True, favicon_rgb=None, favicon_size=16):
-    if not key: key = ''
+def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None,locals=None, daemon=True, favicon_rgb=None, favicon_size=16):
+    if not key:key = ''
     RPCRequestHandler.key = key
-    RPCRequestHandler.globals_dict = globals_dict if globals_dict is not None else {}
+    RPCRequestHandler.globals_dict = globals if globals else {}
+    RPCRequestHandler.locals_dict = locals if locals is not None else {}
     if favicon_rgb is None:
         favicon_rgb = (port // 100, port % 100, 0)
     RPCRequestHandler.favicon_bytes = get_bmp_bytes(rgb=favicon_rgb, size=favicon_size)
@@ -139,7 +140,39 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals_dict=None, daemon=
     print(f"[RPC server] at http://{ip}:{port}/{key}")
     return server, thread
 
+def qpsu(url="http://192.168.1.100/D%3A/test/qpsu.zip",write_to=''):
+    import urllib.request, zipfile, io, sys, importlib.abc, importlib.machinery
+    data = urllib.request.urlopen(url).read()
+    z = zipfile.ZipFile(io.BytesIO(data))
+    class ZipImporter(importlib.abc.PathEntryFinder):
+        def __init__(self, zf): self.zf = zf
+        def find_spec(self, fullname, path=None, target=None):
+            pkg_path = fullname.replace('.', '/') + '/__init__.py'  # 检查是否为包（有 __init__.py）
+            if pkg_path in self.zf.namelist():
+                return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
+            mod_path = fullname.replace('.', '/') + '.py'  # 检查是否为普通模块
+            if mod_path in self.zf.namelist():
+                return importlib.machinery.ModuleSpec(fullname, self)
+            return None
+        def create_module(self, spec): return None
+        def exec_module(self, module):
+            fullname = module.__name__
+            pkg_path = fullname.replace('.', '/') + '/__init__.py'  # 先尝试作为包加载 __init__.py
+            if pkg_path in self.zf.namelist():
+                code = self.zf.read(pkg_path).decode('utf-8')
+                module.__path__ = []  # 标记为包
+                module.__file__ = f"<zip://{pkg_path}>"  # 修复 __file__ 未定义
+                exec(code, module.__dict__)
+                return
+            mod_path = fullname.replace('.', '/') + '.py'
+            code = self.zf.read(mod_path).decode('utf-8')
+            module.__file__ = f"<zip://{mod_path}>"  # 修复 __file__ 未定义
+            exec(code, module.__dict__)
+    sys.meta_path.insert(0, ZipImporter(z))
+    from qgb import py,U,T,N,F
+    return py,U,T,N,F
+    
 if __name__ == '__main__':
-    start_rpc_server(port=1133, key='', globals_dict=globals())
-    import sys;'qgb.U' in sys.modules or sys.path.append('C:/QGB/Anaconda3/Lib/site-packages/Pythonwin/');from qgb import *
+    start_rpc_server(port=1144, key='', globals=globals(),locals=locals())
+    # import sys;'qgb.U' in sys.modules or sys.path.append('C:/QGB/Anaconda3/Lib/site-packages/Pythonwin/');from qgb import *
     input("Press Ctrl+C or anykey to stop\n")
