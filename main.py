@@ -20,21 +20,30 @@ from kivy.core.clipboard import Clipboard
 
 class DeviceItem(BoxLayout):
     def __init__(self, name, address, callback, **kwargs):
-        super().__init__(orientation='horizontal', size_hint_y=None, height=50, **kwargs)
+        super().__init__(orientation='vertical', size_hint_y=None, height=100, **kwargs)
         self.callback = callback
         self.device_address = address
+        row1 = BoxLayout(orientation='horizontal', size_hint_y=0.5)
         self.name_label = Label(text=name, size_hint_x=0.6, halign='left', valign='middle')
         self.name_label.bind(size=self.name_label.setter('text_size'))
         self.addr_label = Label(text=address, size_hint_x=0.4, halign='right', valign='middle')
         self.addr_label.bind(size=self.addr_label.setter('text_size'))
-        self.add_widget(self.name_label)
-        self.add_widget(self.addr_label)
+        row1.add_widget(self.name_label)
+        row1.add_widget(self.addr_label)
+        row2 = BoxLayout(orientation='horizontal', size_hint_y=0.5)
+        self.pin_input = TextInput(text='0000', hint_text='PIN', size_hint_x=0.6, multiline=False)
+        self.connect_btn = Button(text='Connect', size_hint_x=0.4)
+        self.connect_btn.bind(on_press=self._on_connect)
+        row2.add_widget(self.pin_input)
+        row2.add_widget(self.connect_btn)
+        self.add_widget(row1)
+        self.add_widget(row2)
 
-    def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos):
-            self.callback(self.device_address)
-            return True
-        return super().on_touch_down(touch)
+    def _on_connect(self, instance):
+        pin = self.pin_input.text.strip()
+        if not pin:
+            pin = '0000'
+        self.callback(self.device_address, pin)
 
 class BluetoothScanner(BoxLayout):
     def __init__(self, **kwargs):
@@ -50,7 +59,7 @@ class BluetoothScanner(BoxLayout):
         self.add_widget(top_bar)
 
         self.msg_text = TextInput(text='', readonly=True, multiline=True,
-                                  size_hint_y=0.6,
+                                  size_hint_y=0.5,
                                   background_color=(0.1,0.1,0.1,1),
                                   foreground_color=(0,1,0,1),
                                   halign='left')
@@ -60,16 +69,18 @@ class BluetoothScanner(BoxLayout):
 
         self.device_container = BoxLayout(orientation='vertical', size_hint_y=None)
         self.device_container.bind(minimum_height=self.device_container.setter('height'))
-        scroll = ScrollView(size_hint_y=0.3)
+        scroll = ScrollView(size_hint_y=0.4)
         scroll.add_widget(self.device_container)
         self.add_widget(scroll)
 
         self.devices = {}
-        self.pending_connections = {}
+        self.pending_pin = {}
+        self.pending_connect = {}
         self.br = None
         self.adapter = None
         self.cast_func = None
         self.bond_receiver = None
+        self.pairing_receiver = None
         if platform == 'android':
             Clock.schedule_once(self.deferred_init, 1)
 
@@ -121,11 +132,11 @@ class BluetoothScanner(BoxLayout):
                 PythonActivity.mActivity.startActivityForResult(intent, 1)
             else:
                 self.show_message('[INFO] Bluetooth ready', (0,1,0,1))
-            self._register_bond_receiver()
+            self._register_receivers()
         except Exception as e:
             self.show_message(f'[ERROR] Init: {e}', (1,0,0,1))
 
-    def _register_bond_receiver(self):
+    def _register_receivers(self):
         try:
             from android.broadcast import BroadcastReceiver
             self.bond_receiver = BroadcastReceiver(
@@ -133,8 +144,13 @@ class BluetoothScanner(BoxLayout):
                 actions=['android.bluetooth.device.action.BOND_STATE_CHANGED']
             )
             self.bond_receiver.start()
+            self.pairing_receiver = BroadcastReceiver(
+                self.on_pairing_request,
+                actions=['android.bluetooth.device.action.PAIRING_REQUEST']
+            )
+            self.pairing_receiver.start()
         except Exception as e:
-            self.show_message(f'[ERROR] Register bond receiver: {e}', (1,0,0,1))
+            self.show_message(f'[ERROR] Register receivers: {e}', (1,0,0,1))
 
     def on_bond_state_changed(self, context, intent):
         try:
@@ -149,16 +165,54 @@ class BluetoothScanner(BoxLayout):
             prev_state = intent.getIntExtra('android.bluetooth.device.extra.PREVIOUS_BOND_STATE', -1)
             self.show_message(f'[BOND] {dev.getName()} [{addr}] {prev_state} -> {bond_state}', (1,1,0,1))
             if bond_state == 12:
-                if addr in self.pending_connections:
-                    self.show_message(f'[BOND] Pairing completed for {dev.getName()}, connecting...', (0,1,0,1))
-                    dev_to_connect = self.pending_connections.pop(addr)
-                    Clock.schedule_once(lambda dt, d=dev_to_connect: self._do_connect(d), 0.5)
-            elif bond_state == 10:
-                if addr in self.pending_connections:
-                    self.show_message(f'[BOND] Pairing failed for {dev.getName()}', (1,0,0,1))
-                    self.pending_connections.pop(addr, None)
+                self.show_message(f'[BOND] Pairing completed for {dev.getName()}', (0,1,0,1))
+                if addr in self.pending_connect and self.pending_connect[addr]:
+                    self.show_message(f'[INFO] Auto-connecting to {dev.getName()}...', (1,1,0,1))
+                    self._do_connect(dev)
+                    self.pending_connect.pop(addr, None)
         except Exception as e:
             self.show_message(f'[ERROR] Bond callback: {e}', (1,0,0,1))
+
+    def on_pairing_request(self, context, intent):
+        try:
+            if intent.getAction() != 'android.bluetooth.device.action.PAIRING_REQUEST':
+                return
+            device = intent.getParcelableExtra('android.bluetooth.device.extra.DEVICE')
+            if not device:
+                return
+            dev = self.cast_func('android.bluetooth.BluetoothDevice', device)
+            addr = dev.getAddress()
+            pin = self.pending_pin.get(addr, '0000')
+            self.show_message(f'[PAIRING] Using PIN: {pin}', (1,1,0,1))
+
+            # 使用 jnius 直接调用隐藏 API 的正确方式
+            try:
+                from jnius import autoclass
+                # 获取 BluetoothDevice 的 Class 对象
+                device_class = dev.getClass()
+                # byte[] 类型
+                byte_array_class = autoclass('[B')
+                # 获取 setPin 方法
+                set_pin = device_class.getMethod("setPin", byte_array_class)
+                pin_bytes = pin.encode('utf-8')
+                set_pin.invoke(dev, pin_bytes)
+                # boolean 类型
+                bool_class = autoclass('java.lang.Boolean').TYPE
+                set_confirm = device_class.getMethod("setPairingConfirmation", bool_class)
+                set_confirm.invoke(dev, True)
+                # 可选：取消系统对话框
+                try:
+                    cancel = device_class.getMethod("cancelPairingUserInput")
+                    cancel.invoke(dev)
+                except:
+                    pass
+                self.show_message('[PAIRING] PIN sent successfully', (0,1,0,1))
+            except Exception as e:
+                self.show_message(f'[PAIRING] Reflection error: {e}', (1,0,0,1))
+                # 降级方案：让系统弹出对话框，用户手动输入
+                self.show_message('[PAIRING] Falling back to system dialog', (1,1,0,1))
+        except Exception as e:
+            self.show_message(f'[ERROR] Pairing request: {e}', (1,0,0,1))
 
     def start_scan(self, instance):
         try:
@@ -216,38 +270,31 @@ class BluetoothScanner(BoxLayout):
                 return
             self.devices[addr] = dev
             name = dev.getName() or 'Unknown'
-            item = DeviceItem(name, addr, self.on_device_click)
+            item = DeviceItem(name, addr, self.on_device_connect)
             self.device_container.add_widget(item)
             self.show_message(f'[DEVICE] {name} [{addr}]', (0,1,0,1))
         except Exception as e:
             self.show_message(f'[ERROR] Add device: {e}', (1,0,0,1))
 
-    def on_device_click(self, mac_addr):
+    def on_device_connect(self, mac_addr, pin):
         dev = self.devices.get(mac_addr)
-        if dev:
-            self.connect_device(dev)
-        else:
+        if not dev:
             self.show_message('[ERROR] Device not found', (1,0,0,1))
-
-    def connect_device(self, dev):
-        try:
-            bond_state = dev.getBondState()
-            self.show_message(f'[INFO] Device {dev.getName()} bond state: {bond_state}', (1,1,0,1))
-            if bond_state == 12:
-                self._do_connect(dev)
-            elif bond_state == 11:
-                self.show_message(f'[INFO] Pairing in progress, waiting...', (1,1,0,1))
-                self.pending_connections[dev.getAddress()] = dev
-            elif bond_state == 10:
-                self.show_message(f'[PAIR] Pairing with {dev.getName()}...', (1,1,0,1))
-                self.pending_connections[dev.getAddress()] = dev
-                if self.adapter.isDiscovering():
-                    self.adapter.cancelDiscovery()
-                dev.createBond()
-            else:
-                self.show_message(f'[ERROR] Unknown bond state: {bond_state}', (1,0,0,1))
-        except Exception as e:
-            self.show_message(f'[ERROR] Connect error: {e}', (1,0,0,1))
+            return
+        self.pending_pin[mac_addr] = pin
+        bond_state = dev.getBondState()
+        self.show_message(f'[CONN] {dev.getName()} bond state: {bond_state}', (1,1,0,1))
+        if bond_state == 12:
+            self._do_connect(dev)
+        elif bond_state == 11:
+            self.show_message('[INFO] Pairing in progress, will auto-connect after bond', (1,1,0,1))
+            self.pending_connect[mac_addr] = True
+        else:
+            self.show_message(f'[PAIR] Starting pairing with {dev.getName()} using PIN {pin}', (1,1,0,1))
+            if self.adapter.isDiscovering():
+                self.adapter.cancelDiscovery()
+            self.pending_connect[mac_addr] = True
+            dev.createBond()
 
     def _do_connect(self, dev):
         threading.Thread(target=self._rfcomm_connect, args=(dev,), daemon=True).start()
@@ -260,67 +307,57 @@ class BluetoothScanner(BoxLayout):
             UUID = autoclass('java.util.UUID')
             SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
-            # 先打印设备支持的 UUID
-            try:
-                uuids = dev.getUuids()
-                if uuids:
-                    uuid_list = [str(u) for u in uuids]
-                    Clock.schedule_once(lambda dt: self.show_message(f'[UUID] {name}: {", ".join(uuid_list)}', (0,1,1,1)))
-                else:
-                    Clock.schedule_once(lambda dt: self.show_message(f'[UUID] {name}: None (may be BLE)', (1,1,0,1)))
-            except:
-                pass
-
-            # 取消扫描
             if self.adapter.isDiscovering():
                 self.adapter.cancelDiscovery()
             time.sleep(0.3)
 
-            # 方法1: 安全 RFCOMM
+            # 安全连接
             try:
                 socket = dev.createRfcommSocketToServiceRecord(SPP_UUID)
                 socket.connect()
-                Clock.schedule_once(lambda dt: self.show_message(f'[SUCCESS] Connected (secure) to {name}', (0,1,0,1)))
+                Clock.schedule_once(lambda dt, n=name: self.show_message(f'[SUCCESS] Connected (secure) to {n}', (0,1,0,1)))
                 return
             except Exception as e:
-                Clock.schedule_once(lambda dt: self.show_message(f'[DEBUG] Secure fail: {str(e)[:80]}', (1,1,0,1)))
+                err = str(e)[:80]
+                Clock.schedule_once(lambda dt, msg=err: self.show_message(f'[DEBUG] Secure fail: {msg}', (1,1,0,1)))
 
-            # 方法2: 不安全 RFCOMM
+            # 不安全连接
             try:
                 socket = dev.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
                 socket.connect()
-                Clock.schedule_once(lambda dt: self.show_message(f'[SUCCESS] Connected (insecure) to {name}', (0,1,0,1)))
+                Clock.schedule_once(lambda dt, n=name: self.show_message(f'[SUCCESS] Connected (insecure) to {n}', (0,1,0,1)))
                 return
             except Exception as e:
-                Clock.schedule_once(lambda dt: self.show_message(f'[DEBUG] Insecure fail: {str(e)[:80]}', (1,1,0,1)))
+                err = str(e)[:80]
+                Clock.schedule_once(lambda dt, msg=err: self.show_message(f'[DEBUG] Insecure fail: {msg}', (1,1,0,1)))
 
-            # 方法3: 反射多通道 (1-5)
+            # 反射通道 1-5
             for channel in range(1, 6):
                 try:
                     method = dev.getClass().getMethod("createRfcommSocket", [autoclass('int')])
                     socket = method.invoke(dev, [channel])
                     socket.connect()
-                    Clock.schedule_once(lambda dt, ch=channel: self.show_message(f'[SUCCESS] Connected (reflection ch{ch}) to {name}', (0,1,0,1)))
+                    Clock.schedule_once(lambda dt, n=name, ch=channel: self.show_message(f'[SUCCESS] Connected (reflection ch{ch}) to {n}', (0,1,0,1)))
                     return
                 except Exception as e:
-                    Clock.schedule_once(lambda dt, ch=channel: self.show_message(f'[DEBUG] Channel {ch} fail: {str(e)[:50]}', (1,1,0,1)))
+                    err = str(e)[:50]
+                    Clock.schedule_once(lambda dt, ch=channel, msg=err: self.show_message(f'[DEBUG] Channel {ch} fail: {msg}', (1,1,0,1)))
                     continue
 
-            # 所有方法都失败
-            raise Exception("All connection methods (secure, insecure, channels 1-5) failed")
-
+            raise Exception("All connection methods failed")
         except Exception as e:
-            error_type = type(e).__name__
-            error_msg = str(e)
+            err_type = type(e).__name__
+            err_msg = str(e)
             traceback.print_exc()
-            Clock.schedule_once(lambda dt: self.show_message(
-                f'[FATAL] Connection Error:\n{error_type}: {error_msg}', (1,0,0,1)))
+            Clock.schedule_once(lambda dt, msg=f'{err_type}: {err_msg}': self.show_message(f'[FATAL] Connection Error:\n{msg}', (1,0,0,1)))
 
     def on_pause(self):
         if self.br:
             self.br.stop()
         if self.bond_receiver:
             self.bond_receiver.stop()
+        if self.pairing_receiver:
+            self.pairing_receiver.stop()
         return True
 
     def on_resume(self):
@@ -328,6 +365,8 @@ class BluetoothScanner(BoxLayout):
             self.br.start()
         if self.bond_receiver:
             self.bond_receiver.start()
+        if self.pairing_receiver:
+            self.pairing_receiver.start()
         return True
 
 class MainApp(App):
