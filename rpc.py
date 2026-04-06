@@ -22,6 +22,7 @@ def get_bmp_bytes(rgb=None, size=(16, 16)):
     return bmp_header + bmp_info + pixels
 
 def pretty_format(obj, width=120):
+    if isinstance(obj,str):return obj
     try:
         from IPython.lib.pretty import pretty
         return pretty(obj, max_width=width)
